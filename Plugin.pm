@@ -38,7 +38,13 @@ $prefs->init({
 	filterSearchResults => 0,
 	playSamples => 1,
 	dontImportPurchases => 1,
+	useChunkedHttpGet => 0,
+	httpRangeSize => 1024,
+	
 });
+
+#$prefs->set('useChunkedHttpGet', 1);
+#$prefs->set('httpRangeSize', 10*1024);
 
 my $log = Slim::Utils::Log->addLogCategory( {
 	category     => 'plugin.qobuz',

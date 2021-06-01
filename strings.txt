@@ -278,3 +278,15 @@ PLUGIN_QOBUZ_PROGRESS_READ_PLAYLISTS
 	EN	Fetching Playlists...
 	FR	Chargement des listes de lecture...
 	NL	Afspeellijsten ophalen...
+	
+PLUGIN_QOBUZ_USE_RANGE
+	EN	Use chuncked download.
+
+PLUGIN_QOBUZ_USE_RANGE_DESC
+	EN	Could help in case of network problems, see below.
+
+PLUGIN_QOBUZ_RANGE_SIZE
+	EN	Size of data chunk (Range).
+
+PLUGIN_QOBUZ_RANGE_SIZE_DESC
+	EN	Size of chunk (Range) used in downloading audio data. <br><br> Greather values means a longer initial delay (actual time depends on network speed and file format) and reduced underrun risk during playback.<br><br>  Values under <strong>512Kb</strong> are reserved to very slow networks, low bitrate (mp3) and small buffer devices (like old SB). <br><br> <strong>1-16 Mb</strong> are rigth for CD quality flac. <br><br> Use <strong>highers</strong> only for Hi-Rez and/or very fast connections.

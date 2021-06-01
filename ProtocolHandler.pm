@@ -7,8 +7,24 @@ use base qw(Slim::Player::Protocols::HTTP);
 use Scalar::Util qw(blessed);
 
 use Slim::Utils::Log;
-use Slim::Utils::Misc;
+#use Slim::Utils::Misc;
 use Slim::Utils::Prefs;
+
+use List::Util qw(min max first);
+use Slim::Utils::Errno;
+
+# Size of the _sysread chunksize AND buffers, NOT to be confuesed with same applied to pipeline and/or player.
+
+use constant MAX_OUT => 512*1024*1024; # safety limit, the out should always be empty, if reached _sysread stops reading from source.
+
+use constant MIN_OUT => 256*1024; # data are not transferred to output until this limit is reached in input.
+use constant RANGE_SIZE => 1024*1024; # size of range in the http get request, not really the chunksize, but similar.
+
+# Note that playback will not start untill the firs http get returns, so the greather value between RANGE_SIZE and MIN_OUT, is the real 
+# threshold.
+
+# Seconds of delay before playback starts (initial buffering seconds)
+use constant BUFFERING_SECONDS => 5;
 
 use Plugins::Qobuz::API;
 use Plugins::Qobuz::API::Common;
@@ -20,15 +36,15 @@ use constant CAN_FLAC_SEEK => (Slim::Utils::Versions->compareVersions($::VERSION
 use constant PAGE_URL_REGEXP => qr{(?:open|play)\.qobuz\.com/(.+)/([a-z0-9]+)};
 Slim::Player::ProtocolHandlers->registerURLHandler(PAGE_URL_REGEXP, __PACKAGE__) if Slim::Player::ProtocolHandlers->can('registerURLHandler');
 
-my $log   = logger('plugin.qobuz');
+my $log = logger('plugin.qobuz');
 my $prefs = preferences('plugin.qobuz');
 
 sub new {
-	my $class  = shift;
-	my $args   = shift;
+	my $class = shift;
+	my $args = shift;
 
-	my $client    = $args->{client};
-	my $song      = $args->{song};
+	my $client = $args->{client};
+	my $song = $args->{song};
 	my $streamUrl = $song->streamUrl() || return;
 
 	main::DEBUGLOG && $log->is_debug && $log->debug( 'Remote streaming Qobuz track: ' . $streamUrl );
@@ -44,7 +60,183 @@ sub new {
 
 	${*$sock}{contentType} = $mime;
 
+	if (defined($sock)) {
+		${*$sock}{'vars'} = { # variables which hold state for this instance:
+			'inBuf' => '', # buffer of received data
+			'outBuf' => '',# buffer of data data ready to be processed
+			'offset' => 0, # offset for next HTTP request
+			'streaming' => 1, # flag for streaming, changes to 0 when all data received
+			'fetching' => 0, # waiting for HTTP data
+		};
+	}
 	return $sock;
+}
+
+sub vars {
+	return ${*{$_[0]}}{'vars'};
+}
+
+# The real delay is caused by max between bufferThreshold*1000 and RANGE_SIZE,
+# no data could be returned before the first chunk is here.
+# If this method is omitted, then player.pm will try to calculate the value using 
+# bitrate and buffersec preference (that is also used to size the buffer), limited
+# at 255 Kb, good for mp3, maybe little for flac 44100/16, inadeguate for HiRez.
+#
+# THE FOLLOWING SEEMS NOT TO WORK...
+#
+
+sub bufferThreshold{
+	my ($class, $client, $url) = @_;
+
+	#We have bufferThreshold in prefs, let's use it.
+	my $clientPrefs= $prefs->client($client);
+
+	my $bufferThreshold= $clientPrefs->get('bufferThreshold');
+
+	if ($bufferThreshold){return $bufferThreshold};
+
+	my $bufferSecs = $prefs->get('bufferSecs') || BUFFERING_SECONDS;
+	#limit to BUFFERING_SECONDS seconds.
+	if ($bufferSecs > BUFFERING_SECONDS){$bufferSecs = BUFFERING_SECONDS;}
+
+	my $format = $class->getFormatForURL($url);
+
+	return ($format eq 'flc' ? 80 : 32) * $bufferSecs;
+
+}
+
+sub sysread {
+	my $self = $_[0];
+	#my $chunk = $_[1];
+	my $chunkSize = $_[2];
+
+	my $metaInterval = ${*$self}{'metaInterval'};
+	my $metaPointer = ${*$self}{'metaPointer'};
+ 
+	#Data::Dump::dump("Plugins::Qobuz::ProtocolHandler - sysread: ", $metaInterval, $metaPointer, $chunkSize);
+	my $readLength;
+
+	#Data::Dump::dump("useChunkedHttpGet: ",$prefs->get('useChunkedHttpGet'));
+	#Data::Dump::dump("httpRangeSize: ", $prefs->get('httpRangeSize'));
+ 
+	if ($metaInterval && ($metaPointer + $chunkSize) > $metaInterval) {
+
+		$chunkSize = $metaInterval - $metaPointer;
+
+		# This is very verbose...
+		#$log->debug("Reduced chunksize to $chunkSize for metadata");
+
+		$readLength = CORE::sysread($self, $_[1], $chunkSize, length($_[1] || '' ))
+		
+	} elsif (!$prefs->get('useChunkedHttpGet')) { 
+		#Data::Dump::dump("CORE::sysread: ", $chunkSize);
+		$readLength = CORE::sysread($self, $_[1], $chunkSize, length($_[1] || ''));
+
+	} else {
+		#Data::Dump::dump("_sysread: ", $prefs->get('httpRangeSize')*1024 || RANGE_SIZE);
+		$readLength = _sysread($self, $_[1]);
+	}
+ 
+	if ($metaInterval && $readLength) {
+
+		$metaPointer += $readLength;
+		${*$self}{'metaPointer'} = $metaPointer;
+
+		# handle instream metadata for shoutcast/icecast
+		if ($metaPointer == $metaInterval) {
+
+			$self->readMetaData();
+
+			${*$self}{'metaPointer'} = 0;
+
+		} elsif ($metaPointer > $metaInterval) {
+
+			main::DEBUGLOG && $log->debug("The shoutcast metadata overshot the interval.");
+		}	
+	}
+
+	return $readLength;
+}
+
+sub _sysread(){
+	use bytes;
+
+	my $self = $_[0];
+
+	my $client = $self->client;
+	my $maxOut = $client->bufferSize() || MAX_OUT;
+	my $rangeSize = $prefs->get('httpRangeSize')*1024 || RANGE_SIZE;
+
+	my $v = $self->vars;
+	my $url = ${*$self}{'url'};
+
+	# need more data
+	if ( length $v->{'outBuf'} < $maxOut && !$v->{'fetching'}) {
+
+		my $range;
+		#Data::Dump::dump("_sysread: fetching", $rangeSize);
+		
+		if ($v->{'streaming'}){
+
+			$range = "bytes=$v->{offset}-" . ($v->{offset} + $rangeSize - 1);
+
+		} else {
+
+			$range = "bytes=$v->{offset}-" . ($v->{offset} + 1);
+		}
+
+		$v->{'fetching'} = 1;
+
+		Slim::Networking::SimpleAsyncHTTP->new(
+			sub {
+				$v->{'inBuf'} .= $_[0]->content;
+				$v->{'fetching'} = 0;
+				$v->{'streaming'} = 0 if length($_[0]->content) < $rangeSize;
+				$v->{offset} += length($_[0]->content);
+
+				main::DEBUGLOG && $log->is_debug && $log->debug("got chunk length: ", length $_[0]->content, " from ", $v->{offset} - $rangeSize, " for $url");
+			},
+			sub { 
+				$log->warn("error fetching $url");
+				$v->{'inBuf'} = '';
+				$v->{'fetching'} = 0;
+			}, 
+
+		)->get($url, 'Range' => $range );
+	}
+	
+	# This is the size of chunck of data moved from in to out buffers.
+	# Standard id 32Kb, resulting in a higly inefficent move.
+	# Move the entire range size or MIN_OUT instead.
+	
+	my $chunckSize = max($rangeSize, MIN_OUT);
+
+	if (length $v->{'inBuf'} >= $chunckSize || !$v->{'streaming'}){
+		
+		#Data::Dump::dump("_sysread: move to Outbuf", length $v->{'inBuf'});
+		
+		$v->{'outBuf'} = $v->{'outBuf'}.$v->{'inBuf'};
+		$v->{'inBuf'}='';
+	}
+
+	my $bytes =length $v->{'outBuf'};
+
+	if ($bytes) {
+		
+		#Data::Dump::dump("_sysread: move to pipeline", $bytes);
+		
+		$_[1] = $_[1].substr($v->{'outBuf'}, 0, $bytes);
+		$v->{'outBuf'} = substr($v->{'outBuf'}, $bytes);
+		return $bytes;
+
+	} elsif ( $v->{streaming} ) {
+		#$! = EINTR; Pipeline does not recocgnize EINTR;
+		$! = EWOULDBLOCK;
+		return undef;
+	} else {
+		#Data::Dump::dump("EOF");
+		return 0; #EOF.
+	}
 }
 
 sub canSeek { 1 }
@@ -157,9 +349,9 @@ sub parseHeaders {
 }
 
 sub parseDirectHeaders {
-	my $class   = shift;
-	my $client  = shift || return;
-	my $url     = shift;
+	my $class = shift;
+	my $client = shift || return;
+	my $url = shift;
 	my @headers = @_;
 
 	# May get a track object
@@ -306,7 +498,6 @@ sub getNextTrack {
 		$errorCb->('Failed to get next track', 'Qobuz');
 	}, $id, $format);
 }
-
 sub crackUrl {
 	my ($class, $url) = @_;
 
